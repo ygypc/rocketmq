@@ -50,6 +50,9 @@ import org.apache.rocketmq.remoting.protocol.RemotingSysResponseCode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * Netty通信处理的抽象类，定义并封装了Netty处理的公共处理方法
+ */
 public abstract class NettyRemotingAbstract {
 
     /**
@@ -161,6 +164,11 @@ public abstract class NettyRemotingAbstract {
      * @param cmd request command.
      */
     public void processRequestCommand(final ChannelHandlerContext ctx, final RemotingCommand cmd) {
+        //根据RemotingCommand中的code获取processor和ExecutorService
+        //根据RemotingCommand的请求业务码来匹配到相应的业务处理器；然后生成一个新的线程提交至对应的业务线程池进行异步处理。
+        //请求业务码与业务处理、业务线程池的映射变量
+        //为了给不同类型的请求业务码指定不同的处理器Processor处理，同时消息实际的处理并不是在当前线程，而是被封装成task放到业务处理器Processor对应的线程池中完成异步执行
+        //这样的设计能够最大程度的保证异步，保证每个线程都专注处理自己负责的东西
         final Pair<NettyRequestProcessor, ExecutorService> matched = this.processorTable.get(cmd.getCode());
         final Pair<NettyRequestProcessor, ExecutorService> pair = null == matched ? this.defaultRequestProcessor : matched;
         final int opaque = cmd.getOpaque();
@@ -174,7 +182,7 @@ public abstract class NettyRemotingAbstract {
                         if (rpcHook != null) {
                             rpcHook.doBeforeRequest(RemotingHelper.parseChannelRemoteAddr(ctx.channel()), cmd);
                         }
-
+                        //processor处理请求
                         final RemotingCommand response = pair.getObject1().processRequest(ctx, cmd);
                         if (rpcHook != null) {
                             rpcHook.doAfterResponse(RemotingHelper.parseChannelRemoteAddr(ctx.channel()), cmd, response);
@@ -219,6 +227,7 @@ public abstract class NettyRemotingAbstract {
 
             try {
                 final RequestTask requestTask = new RequestTask(run, ctx.channel(), cmd);
+                ////想线程池提交requestTask
                 pair.getObject2().submit(requestTask);
             } catch (RejectedExecutionException e) {
                 if ((System.currentTimeMillis() % 10000) == 0) {
@@ -252,7 +261,9 @@ public abstract class NettyRemotingAbstract {
      * @param cmd response command instance.
      */
     public void processResponseCommand(ChannelHandlerContext ctx, RemotingCommand cmd) {
+        ////从RemotingCommand中获取opaque值
         final int opaque = cmd.getOpaque();
+        //从本地缓存的responseTable这个Map中取出本次异步通信连接对应的ResponseFuture变量
         final ResponseFuture responseFuture = responseTable.get(opaque);
         if (responseFuture != null) {
             responseFuture.setResponseCommand(cmd);
@@ -260,6 +271,7 @@ public abstract class NettyRemotingAbstract {
             responseTable.remove(opaque);
 
             if (responseFuture.getInvokeCallback() != null) {
+                ////在这里真正去执行Client注入进来的异步回调方法
                 executeInvokeCallback(responseFuture);
             } else {
                 responseFuture.putResponse(cmd);
@@ -328,6 +340,12 @@ public abstract class NettyRemotingAbstract {
     /**
      * <p>
      * This method is periodically invoked to scan and expire deprecated request.
+     * 异常发送流程处理—定时扫描responseTable本地缓存
+     * 在发送消息时候，如果遇到异常情况（比如服务端没有response返回给客户端或者response因网络而丢失），
+     * 上面所述的responseTable的本地缓存Map将会出现堆积情况。
+     * 这个时候需要一个定时任务来专门做responseTable的清理回收。
+     * 在RocketMQ的客户端/服务端启动时候会产生一个频率为1s调用一次来的定时任务检查所有的responseTable缓存中的responseFuture变量，
+     * 判断是否已经得到返回, 并进行相应的处理。
      * </p>
      */
     public void scanResponseTable() {
@@ -396,21 +414,41 @@ public abstract class NettyRemotingAbstract {
         }
     }
 
+    /**
+     * 异步调用
+     * @param channel
+     * @param request
+     * @param timeoutMillis
+     * @param invokeCallback
+     * @throws InterruptedException
+     * @throws RemotingTooMuchRequestException
+     * @throws RemotingTimeoutException
+     * @throws RemotingSendRequestException
+     */
     public void invokeAsyncImpl(final Channel channel, final RemotingCommand request, final long timeoutMillis,
         final InvokeCallback invokeCallback)
         throws InterruptedException, RemotingTooMuchRequestException, RemotingTimeoutException, RemotingSendRequestException {
+        ////相当于request ID, RemotingCommand会为每一个request产生一个request ID, 从0开始, 每次加1
         final int opaque = request.getOpaque();
+        //semaphore参数用作流控，当多个线程同时往一个连接写数据时可以通过信号量控制permit同时写许可的数量。
         boolean acquired = this.semaphoreAsync.tryAcquire(timeoutMillis, TimeUnit.MILLISECONDS);
         if (acquired) {
             final SemaphoreReleaseOnlyOnce once = new SemaphoreReleaseOnlyOnce(this.semaphoreAsync);
-
+            //根据request ID构建ResponseFuture   保存返回响应（包括回调执行方法和信号量）
             final ResponseFuture responseFuture = new ResponseFuture(opaque, timeoutMillis, invokeCallback, once);
+            //将ResponseFuture放入responseTable 保存请求码与响应关联映射
+            //opaque表示请求发起方在同个连接上不同的请求标识代码，每次发送一个消息的时候，
+            // 可以选择同步阻塞/异步非阻塞的方式。无论是哪种通信方式，
+            // 都会保存请求操作码至ResponseFuture的Map映射—responseTable中
             this.responseTable.put(opaque, responseFuture);
             try {
+                //使用Netty的channel发送请求数据
                 channel.writeAndFlush(request).addListener(new ChannelFutureListener() {
+                    //消息发送后执行
                     @Override
                     public void operationComplete(ChannelFuture f) throws Exception {
                         if (f.isSuccess()) {
+                            //如果发送消息成功给Server，那么这里直接Set后return
                             responseFuture.setSendRequestOK(true);
                             return;
                         } else {
@@ -420,6 +458,7 @@ public abstract class NettyRemotingAbstract {
                         responseFuture.putResponse(null);
                         responseTable.remove(opaque);
                         try {
+                            ////执行回调
                             executeInvokeCallback(responseFuture);
                         } catch (Throwable e) {
                             log.warn("excute callback in writeAndFlush addListener, and callback throw", e);

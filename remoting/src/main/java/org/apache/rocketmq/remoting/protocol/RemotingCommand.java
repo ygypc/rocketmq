@@ -31,6 +31,9 @@ import org.apache.rocketmq.remoting.exception.RemotingCommandException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * 这个类在消息传输过程中对所有数据内容的封装，不但包含了所有的数据结构，还包含了编码解码操作
+ */
 public class RemotingCommand {
     public static final String SERIALIZE_TYPE_PROPERTY = "rocketmq.serialize.type";
     public static final String SERIALIZE_TYPE_ENV = "ROCKETMQ_SERIALIZE_TYPE";
@@ -69,12 +72,36 @@ public class RemotingCommand {
         }
     }
 
+    /**
+     * 请求操作码，应答方根据不同的请求码进行不同的业务处理
+     * 应答响应码。0表示成功，非0则表示各种错误
+     */
     private int code;
+    /**
+     * 请求方实现的语言
+     * 应答方实现的语言
+     */
     private LanguageCode language = LanguageCode.JAVA;
+    /**
+     * 请求方程序的版本	应答方程序的版本
+     */
     private int version = 0;
+    /**
+     * 相当于reqeustId，在同一个连接上的不同请求标识码，与响应消息中的相对应
+     * 应答不做修改直接返回
+     */
     private int opaque = requestId.getAndIncrement();
+    /**
+     * 区分是普通RPC还是onewayRPC得标志
+     */
     private int flag = 0;
+    /**
+     * 传输自定义文本信息
+     */
     private String remark;
+    /**
+     * 请求自定义扩展信息	响应自定义扩展信息
+     */
     private HashMap<String, String> extFields;
     private transient CommandCustomHeader customHeader;
 
@@ -241,6 +268,7 @@ public class RemotingCommand {
         } catch (IllegalAccessException e) {
             return null;
         }
+        
 
         if (this.extFields != null) {
 

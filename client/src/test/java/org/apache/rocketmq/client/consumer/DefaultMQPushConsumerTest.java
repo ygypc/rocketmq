@@ -106,6 +106,7 @@ public class DefaultMQPushConsumerTest {
         field.setAccessible(true);
         field.set(pushConsumerImpl, rebalancePushImpl);
         pushConsumer.subscribe(topic, "*");
+
         pushConsumer.start();
 
         mQClientFactory = spy(pushConsumerImpl.getmQClientFactory());
